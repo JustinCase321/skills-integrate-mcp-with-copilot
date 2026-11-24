@@ -1,23 +1,29 @@
 """
-High School Management System API
+High School Activities API
 
-A super simple FastAPI application that allows students to view and sign up
-for extracurricular activities at Mergington High School.
+A simple FastAPI application that allows students to view activities and
+teachers to manage student registrations at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+import json
+import os
+import secrets
+from pathlib import Path
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
-import os
-from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
-              description="API for viewing and signing up for extracurricular activities")
+              description="API for viewing activities and managing registrations")
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+teacher_security = HTTPBasic(auto_error=False)
 
 # In-memory activity database
 activities = {
@@ -88,8 +94,85 @@ def get_activities():
     return activities
 
 
+def authenticate_teacher(
+    credentials: Annotated[
+        HTTPBasicCredentials | None, Depends(teacher_security)
+    ],
+):
+    """Validate teacher credentials configured in the environment."""
+    configured_credentials = os.environ.get("TEACHER_CREDENTIALS")
+
+    if not configured_credentials:
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher login is not configured",
+        )
+
+    try:
+        teacher_credentials = json.loads(configured_credentials)
+    except json.JSONDecodeError as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher credentials configuration is invalid",
+        ) from error
+
+    if (
+        not isinstance(teacher_credentials, dict)
+        or not teacher_credentials
+        or any(
+            not isinstance(username, str)
+            or not username
+            or not isinstance(password, str)
+            or not password
+            for username, password in teacher_credentials.items()
+        )
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Teacher credentials configuration is invalid",
+        )
+
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid teacher credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    credentials_match = False
+    for username, password in teacher_credentials.items():
+        username_matches = secrets.compare_digest(
+            credentials.username.encode("utf-8"), username.encode("utf-8")
+        )
+        password_matches = secrets.compare_digest(
+            credentials.password.encode("utf-8"), password.encode("utf-8")
+        )
+        credentials_match |= username_matches & password_matches
+
+    if not credentials_match:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid teacher credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    return credentials.username
+
+
+@app.get("/auth/session")
+def get_teacher_session(
+    username: Annotated[str, Depends(authenticate_teacher)],
+):
+    """Verify teacher credentials without exposing them to the client."""
+    return {"username": username}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    _teacher: Annotated[str, Depends(authenticate_teacher)],
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +194,11 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    _teacher: Annotated[str, Depends(authenticate_teacher)],
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
